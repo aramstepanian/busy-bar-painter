@@ -47,6 +47,16 @@ The USB cable presents the bar as a network device at `10.0.4.20`. macOS may ask
 
 Leave `BUSY_PIN` empty for the USB cable. The bar's own docs treat USB as a trusted link and do not require the HTTP API PIN there. If a draw comes back HTTP 403, set `BUSY_PIN` to the PIN from the bar's local web interface (Network, HTTP API). The painter sends that value in the `X-API-Token` header.
 
+USB frames go out one at a time, about every 2 seconds, and each draw waits up to 8 seconds. An unchanged frame is not sent again. One slow draw stays on that 2 second cadence. Two failures in a row switch to a longer wait.
+
+## If weather goes blank or DNS fails
+
+The Mac can lose DNS while the Busy Bar USB interface is first in the service order. Weather and the ISS lookup then fail with `nodename nor servname provided`. The painter keeps the last good weather in `~/.busy-bar-painter/weather.json` and keeps showing that temperature. It tries again every 5 minutes, and waits longer after each failure.
+
+When that happens the log says this once:
+
+`DNS failed. In System Settings > Network > Set Service Order, move the Busy Bar USB interface below Wi-Fi.`
+
 ## Pause the hosted Fly painter
 
 If a painter hosted on Fly is also drawing to this bar, pause that app before you start this one. Two painters writing the screen at the same time will take turns overwriting each other.
@@ -70,7 +80,7 @@ Set `BUSY_TRANSPORT=cloud` and `BUSY_BAR_TOKEN` to a bar-scope token from your B
 
 Other commands:
 
-A frame that times out is logged once. The painter keeps running and waits a few seconds before it tries again, so a hung request does not spin.
+A single draw timeout stays on the normal cadence. The longer wait starts after two failures in a row, and that timeout is logged once.
 
 ```bash
 ./run.sh --once       # draw one frame and exit

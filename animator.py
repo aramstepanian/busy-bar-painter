@@ -534,7 +534,115 @@ def fetch_weather() -> dict:
         "sunrise": parse_local_iso(rise_s),
         "sunset": parse_local_iso(set_s),
         "cloud": cur.get("cloud_cover"),
+        "lat": HOME_LAT,
+        "lon": HOME_LON,
     }
+
+
+def weather_cache_path() -> str:
+    return os.path.join(os.path.expanduser("~"), ".busy-bar-painter", "weather.json")
+
+
+def _weather_from_cache(data: dict) -> dict | None:
+    if not isinstance(data, dict):
+        return None
+    weather = data.get("weather")
+    if weather not in WEATHERS:
+        return None
+    try:
+        lat = float(data.get("lat", HOME_LAT))
+        lon = float(data.get("lon", HOME_LON))
+    except (TypeError, ValueError):
+        return None
+    if abs(lat - HOME_LAT) > 0.05 or abs(lon - HOME_LON) > 0.05:
+        return None
+    temp = data.get("temp_c")
+    if temp is not None:
+        try:
+            temp = int(temp)
+        except (TypeError, ValueError):
+            temp = None
+    return {
+        "temp_c": temp,
+        "weather": weather,
+        "code": data.get("code"),
+        "sunrise": parse_local_iso(data.get("sunrise")),
+        "sunset": parse_local_iso(data.get("sunset")),
+        "cloud": data.get("cloud"),
+        "lat": lat,
+        "lon": lon,
+    }
+
+
+def load_weather_cache(path: str | None = None) -> dict | None:
+    path = path or weather_cache_path()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return _weather_from_cache(data)
+
+
+def save_weather_cache(weather: dict, path: str | None = None) -> None:
+    path = path or weather_cache_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {
+        "temp_c": weather.get("temp_c"),
+        "weather": weather.get("weather"),
+        "code": weather.get("code"),
+        "cloud": weather.get("cloud"),
+        "lat": weather.get("lat", HOME_LAT),
+        "lon": weather.get("lon", HOME_LON),
+        "sunrise": weather["sunrise"].isoformat() if isinstance(weather.get("sunrise"), datetime) else None,
+        "sunset": weather["sunset"].isoformat() if isinstance(weather.get("sunset"), datetime) else None,
+        "saved_at": time.time(),
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    os.replace(tmp, path)
+
+
+DNS_HINT = (
+    "DNS failed. In System Settings > Network > Set Service Order, "
+    "move the Busy Bar USB interface below Wi-Fi."
+)
+_DNS_HINTED = False
+
+
+def is_dns_error(exc: BaseException) -> bool:
+    """True for macOS Errno 8 and other resolver failures."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, socket.gaierror):
+            return True
+        text = str(current).lower()
+        if (
+            "nodename nor servname" in text
+            or "name or service not known" in text
+            or "temporary failure in name resolution" in text
+            or "[errno 8]" in text
+        ):
+            return True
+        reason = getattr(current, "reason", None)
+        if isinstance(reason, BaseException):
+            current = reason
+            continue
+        cause = current.__cause__
+        current = cause if isinstance(cause, BaseException) else None
+    return False
+
+
+def note_dns(exc: BaseException) -> None:
+    """Log the service-order hint once per process."""
+    global _DNS_HINTED
+    if _DNS_HINTED:
+        return
+    _DNS_HINTED = True
+    log.error("%s (%s)", DNS_HINT, exc)
 
 
 def _ecef(lat: float, lon: float, alt_km: float) -> tuple[float, float, float]:
@@ -591,8 +699,12 @@ def fetch_iss() -> dict | None:
             }
         except Exception as exc:  # noqa: BLE001
             last_err = exc
+            if is_dns_error(exc):
+                break
             continue
     if last_err:
+        if is_dns_error(last_err):
+            raise last_err
         log.warning("ISS poll failed: %s", last_err)
     return None
 
@@ -1178,10 +1290,14 @@ def apply_place(lat: float, lon: float, tz_name: str, label: str) -> None:
 # connection and then sends nothing. Probe /api/version, then /api/status.
 PROBE_PATHS = ("/api/version", "/api/status")
 PROBE_TIMEOUT = 2.0
-DRAW_TIMEOUT = 3.0
+DRAW_TIMEOUT = 8.0
 FRAME_PAUSE = 1.0
+USB_FRAME_PAUSE = 2.0
 RETRY_MIN = 5.0
 RETRY_MAX = 20.0
+FAILS_BEFORE_BACKOFF = 2
+WEATHER_INTERVAL = 300.0
+WEATHER_BACKOFF_MAX = 1800.0
 # busylib-ts sends this with the semver from GET /version. The published
 # OpenAPI 27.5.0 draw operation does not list a version header. We still
 # echo the semver the bar just reported. X-Busy-Api-Version is the Python
@@ -1209,15 +1325,37 @@ def local_draw_url(host: str) -> str:
     return local_url(host, "/api/display/draw")
 
 
-def pace(failed: bool, backoff: float) -> tuple[float, float]:
+def pace(failed: bool, backoff: float, pause: float = FRAME_PAUSE) -> tuple[float, float]:
     """Seconds to sleep, and the backoff to use after the next failure.
 
     A failed frame waits at least RETRY_MIN seconds. The wait grows until
-    RETRY_MAX so a hung bar is not polled in a tight loop.
+    RETRY_MAX so a hung bar is not polled in a tight loop. USB passes a
+    longer pause so draws are about one every 2 seconds.
     """
     if not failed:
-        return FRAME_PAUSE, RETRY_MIN
+        return pause, RETRY_MIN
     return backoff, min(backoff * 2.0, RETRY_MAX)
+
+
+def should_backoff(consecutive_failures: int) -> bool:
+    """One slow frame stays on the normal cadence. Two in a row back off."""
+    return consecutive_failures >= FAILS_BEFORE_BACKOFF
+
+
+def frame_signature(elements: list[dict]) -> str:
+    return json.dumps(elements, sort_keys=True, separators=(",", ":"))
+
+
+_DRAW_LOCK = threading.Lock()
+
+
+def begin_draw() -> bool:
+    """True when this caller owns the single in-flight draw."""
+    return _DRAW_LOCK.acquire(blocking=False)
+
+
+def end_draw() -> None:
+    _DRAW_LOCK.release()
 
 
 class FailureNotice:
@@ -1354,11 +1492,16 @@ def draw_request(
 
 
 def post_draw(cfg: Settings, elements: list[dict], api_semver: str | None) -> HttpResult:
-    """POST one frame. Same element ids replace the previous frame in place."""
+    """POST one frame. A second draw waits until this one has finished."""
     if cfg.transport == "cloud" and not cfg.token:
         return HttpResult(CLOUD_DRAW_URL, None, "", "BUSY_BAR_TOKEN is unset")
     url, headers, body = draw_request(cfg, elements, api_semver=api_semver)
-    return http_exchange("POST", url, headers, body, timeout=DRAW_TIMEOUT)
+    if not begin_draw():
+        return HttpResult(url, None, "", "draw already in progress")
+    try:
+        return http_exchange("POST", url, headers, body, timeout=DRAW_TIMEOUT)
+    finally:
+        end_draw()
 
 
 def _print_http(label: str, result: HttpResult) -> None:
@@ -1634,26 +1777,51 @@ def start_server(handler: type[BaseHTTPRequestHandler], host: str, port: int) ->
 # ---------------------------------------------------------------------------
 
 class Painter:
-    def __init__(self) -> None:
+    def __init__(self, weather_path: str | None = None) -> None:
+        self.weather_path = weather_path or weather_cache_path()
         self.weather = {
             "temp_c": None,
             "weather": "clear",
             "sunrise": None,
             "sunset": None,
         }
+        cached = load_weather_cache(self.weather_path)
+        if cached:
+            self.weather = cached
+            log.info(
+                "weather cache %s %s",
+                format_temp(cached.get("temp_c")),
+                cached.get("weather"),
+            )
         self.iss: dict | None = None
         self.weather_ts = 0.0
+        self.weather_every = WEATHER_INTERVAL
+        self.weather_backoff = WEATHER_INTERVAL
         self.iss_ts = 0.0
         self.iss_every = 5.0
 
     def refresh(self, now: float) -> None:
-        if now - self.weather_ts > 600 or not self.weather_ts:
+        if now - self.weather_ts >= self.weather_every or not self.weather_ts:
             try:
-                self.weather = fetch_weather()
-                self.weather_ts = now
+                got = fetch_weather()
             except Exception as exc:  # noqa: BLE001
-                log.warning("weather fetch failed: %s", exc)
-                self.weather_ts = now - 540  # retry sooner
+                # Keep the cached reading. A DNS failure must not blank the temperature.
+                self.weather_ts = now
+                self.weather_every = self.weather_backoff
+                self.weather_backoff = min(self.weather_backoff * 2.0, WEATHER_BACKOFF_MAX)
+                if is_dns_error(exc):
+                    note_dns(exc)
+                else:
+                    log.warning("weather fetch failed: %s", exc)
+            else:
+                self.weather = got
+                self.weather_ts = now
+                self.weather_every = WEATHER_INTERVAL
+                self.weather_backoff = WEATHER_INTERVAL
+                try:
+                    save_weather_cache(got, self.weather_path)
+                except OSError as exc:
+                    log.warning("weather cache write failed: %s", exc)
         if now - self.iss_ts >= self.iss_every or not self.iss_ts:
             try:
                 got = fetch_iss()
@@ -1665,9 +1833,13 @@ class Painter:
                     self.iss_every = 60.0
                 self.iss_ts = now
             except Exception as exc:  # noqa: BLE001
-                log.warning("ISS fetch failed: %s", exc)
                 self.iss_ts = now
-                self.iss_every = 60.0
+                if is_dns_error(exc):
+                    note_dns(exc)
+                    self.iss_every = self.weather_every
+                else:
+                    log.warning("ISS fetch failed: %s", exc)
+                    self.iss_every = 60.0
 
     def frame(self, dt: datetime) -> tuple[Canvas, list[dict], dict]:
         period = period_for(dt)
@@ -1702,11 +1874,22 @@ def _remember(ok: bool | None, error: str | None, frames_inc: bool, semver: str 
             STATE["frames"] = int(STATE["frames"]) + 1
 
 
+def _draw_failure_detail(cfg: Settings, result: HttpResult) -> str:
+    detail = result.error or f"HTTP {result.status} {result.body[:180]}".strip()
+    if result.status == 403 and cfg.transport == "usb" and not cfg.pin:
+        detail = f"{detail} Set BUSY_PIN to the bar HTTP API PIN."
+    return detail
+
+
 def run_loop(cfg: Settings, painter: Painter, once: bool = False) -> int:
     notice = FailureNotice()
     backoff = RETRY_MIN
     semver: str | None = None
     semver_known = cfg.transport != "usb"
+    pause = USB_FRAME_PAUSE if cfg.transport == "usb" else FRAME_PAUSE
+    last_signature: str | None = None
+    streak = 0
+    backing_off = False
     while True:
         failed = False
         try:
@@ -1714,6 +1897,7 @@ def run_loop(cfg: Settings, painter: Painter, once: bool = False) -> int:
             painter.refresh(now)
             dt = datetime.now(TZ)
             _canvas, elements, meta = painter.frame(dt)
+            signature = frame_signature(elements)
             with _STATE_LOCK:
                 STATE.update(
                     {
@@ -1733,6 +1917,15 @@ def run_loop(cfg: Settings, painter: Painter, once: bool = False) -> int:
                 if notice.once("BUSY_BAR_TOKEN is unset"):
                     log.warning("BUSY_BAR_TOKEN is unset, so cloud mode is not drawing")
                 _remember(None, "BUSY_BAR_TOKEN is unset", True, None)
+            elif signature == last_signature:
+                streak = 0
+                if backing_off:
+                    backing_off = False
+                    if notice.recovered():
+                        log.info("bar is answering again")
+                backoff = RETRY_MIN
+                _remember(True, None, False, semver)
+                log.debug("frame unchanged, skip draw")
             else:
                 if cfg.transport == "usb" and not semver_known:
                     found, probes = probe_bar(cfg)
@@ -1753,9 +1946,15 @@ def run_loop(cfg: Settings, painter: Painter, once: bool = False) -> int:
                     if semver:
                         log.info("bar api_semver %s", semver)
                     result = post_draw(cfg, elements, semver)
-                if result.ok:
-                    if notice.recovered():
-                        log.info("bar is answering again")
+                if result.error == "draw already in progress":
+                    log.debug("draw still in flight, skip")
+                elif result.ok:
+                    last_signature = signature
+                    streak = 0
+                    if backing_off:
+                        backing_off = False
+                        if notice.recovered():
+                            log.info("bar is answering again")
                     backoff = RETRY_MIN
                     _remember(True, None, True, semver)
                     log.info(
@@ -1769,23 +1968,31 @@ def run_loop(cfg: Settings, painter: Painter, once: bool = False) -> int:
                         meta["park"],
                     )
                 else:
-                    failed = True
-                    detail = result.error or f"HTTP {result.status} {result.body[:180]}".strip()
-                    if result.status == 403 and cfg.transport == "usb" and not cfg.pin:
-                        detail = f"{detail} Set BUSY_PIN to the bar HTTP API PIN."
-                    if notice.once(detail):
-                        log.error("draw %s", detail)
+                    streak += 1
+                    detail = _draw_failure_detail(cfg, result)
+                    if should_backoff(streak):
+                        failed = True
+                        backing_off = True
+                        if notice.once(detail):
+                            log.error("draw %s", detail)
+                    else:
+                        log.warning("draw %s", detail)
                     _remember(False, detail, False, semver)
         except Exception as exc:  # noqa: BLE001 - one bad frame must not kill the painter
-            failed = True
+            streak += 1
             detail = f"{type(exc).__name__}: {exc}"
-            if notice.once(detail):
-                log.error("frame failed: %s\n%s", exc, traceback.format_exc())
+            if should_backoff(streak):
+                failed = True
+                backing_off = True
+                if notice.once(detail):
+                    log.error("frame failed: %s\n%s", exc, traceback.format_exc())
+            else:
+                log.warning("frame failed: %s", exc)
             _remember(False, detail, False, semver)
         if once:
             with _STATE_LOCK:
                 return 0 if STATE.get("last_draw_ok") else 1
-        wait, backoff = pace(failed, backoff)
+        wait, backoff = pace(failed, backoff, pause)
         time.sleep(wait)
 
 
@@ -2191,8 +2398,86 @@ def self_test() -> int:
     check(notice.recovered() is True, "recovery is announced once")
     check(notice.recovered() is False, "recovery does not repeat")
     check(pace(False, 20.0) == (FRAME_PAUSE, RETRY_MIN), "success returns to the frame pause")
+    check(pace(False, 20.0, USB_FRAME_PAUSE) == (USB_FRAME_PAUSE, RETRY_MIN), "usb cadence is 2s")
+    check(DRAW_TIMEOUT == 8.0, "draw timeout is 8s")
+    check(not should_backoff(0) and not should_backoff(1) and should_backoff(2), "backoff after 2 failures")
     check(pace(True, RETRY_MIN) == (RETRY_MIN, RETRY_MIN * 2), "first failure waits")
     check(pace(True, RETRY_MAX)[0] >= RETRY_MIN, "backoff never tightens to the frame pause")
+    same = [{"id": "frame", "text": "2:08"}]
+    check(frame_signature(same) == frame_signature([{"text": "2:08", "id": "frame"}]), "frame signature is stable")
+    check(frame_signature(same) != frame_signature([{"id": "frame", "text": "2:09"}]), "clock change is a new frame")
+    check(begin_draw() is True, "first draw owns the bar")
+    check(begin_draw() is False, "second draw does not overlap")
+    end_draw()
+    check(begin_draw() is True, "draw lock released after the first draw finishes")
+    end_draw()
+    dns_exc = socket.gaierror(8, "nodename nor servname provided, or not known")
+    check(is_dns_error(dns_exc), "gaierror is dns")
+    check(is_dns_error(urllib.error.URLError(dns_exc)), "wrapped dns")
+    check(is_dns_error(OSError("[Errno 8] nodename nor servname provided, or not known")), "errno 8 text")
+    check("Set Service Order" in DNS_HINT and "below Wi-Fi" in DNS_HINT, "dns hint")
+    cache_path = os.path.join(PREVIEW_DIR, "weather-cache-test.json")
+    os.makedirs(PREVIEW_DIR, exist_ok=True)
+    save_weather_cache(
+        {
+            "temp_c": 19,
+            "weather": "fog",
+            "code": 45,
+            "cloud": 100,
+            "lat": HOME_LAT,
+            "lon": HOME_LON,
+            "sunrise": None,
+            "sunset": None,
+        },
+        cache_path,
+    )
+    loaded = load_weather_cache(cache_path)
+    check(loaded is not None and loaded["temp_c"] == 19 and loaded["weather"] == "fog", "cache roundtrip")
+    check(format_temp(None if loaded is None else loaded["temp_c"]) == "19C", "cached temp replaces blank")
+    save_weather_cache(
+        {"temp_c": 10, "weather": "clear", "lat": 0.0, "lon": 0.0, "sunrise": None, "sunset": None},
+        cache_path,
+    )
+    check(load_weather_cache(cache_path) is None, "other places do not reuse this cache")
+    save_weather_cache(
+        {
+            "temp_c": 19,
+            "weather": "fog",
+            "code": 45,
+            "lat": HOME_LAT,
+            "lon": HOME_LON,
+            "sunrise": None,
+            "sunset": None,
+        },
+        cache_path,
+    )
+    saved_fetch = fetch_weather
+    saved_iss = fetch_iss
+
+    def _dns_fail() -> dict:
+        raise socket.gaierror(8, "nodename nor servname provided, or not known")
+
+    globals()["fetch_weather"] = _dns_fail
+    globals()["fetch_iss"] = lambda: None
+    try:
+        painter = Painter(weather_path=cache_path)
+        check(painter.weather.get("temp_c") == 19, "painter starts from the cache")
+        painter.refresh(1_000_000.0)
+        check(painter.weather.get("temp_c") == 19, "dns failure keeps the cached temperature")
+        check(format_temp(painter.weather.get("temp_c")) == "19C", "display temp stays 19C")
+        check(painter.weather_every == WEATHER_INTERVAL, "first weather failure waits 5 min")
+        painter.weather_ts = 0.0
+        painter.refresh(1_000_000.0)
+        check(painter.weather_every == WEATHER_INTERVAL * 2, "second weather failure backs off")
+        check(_DNS_HINTED is True, "dns hint was logged")
+    finally:
+        globals()["fetch_weather"] = saved_fetch
+        globals()["fetch_iss"] = saved_iss
+        globals()["_DNS_HINTED"] = False
+        try:
+            os.remove(cache_path)
+        except OSError:
+            pass
     hang = socket.socket()
     hang.bind(("127.0.0.1", 0))
     hang.listen(1)
