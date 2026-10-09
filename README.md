@@ -25,10 +25,16 @@ The painter reads environment variables first. Anything still unset is filled fr
 ## Check that the bar answers over USB
 
 ```bash
-curl -fsS --max-time 5 http://10.0.4.20/api/status/firmware
+curl -fsS --max-time 3 http://10.0.4.20/api/version
 ```
 
-A JSON body means the bar is on the USB link. The same host serves `GET /api/version` and `GET /api/status` if you want a second look. Drawing uses `POST /api/display/draw`.
+A JSON body such as `{"api_semver":"27.5.0"}` means the bar is on the USB link. `GET /api/status` is the fallback and returns firmware, power, and `system.api_semver`. Leave `GET /api/status/firmware` unused: on firmware 1.2.4 it accepts the TCP connection and then sends no bytes, so a client waits until it times out. Drawing uses `POST /api/display/draw`.
+
+```bash
+./run.sh --diagnose
+```
+
+That prints the version probe and one test draw, each with its HTTP status and body, then exits.
 
 ## If 10.0.4.20 does not respond
 
@@ -64,8 +70,11 @@ Set `BUSY_TRANSPORT=cloud` and `BUSY_BAR_TOKEN` to a bar-scope token from your B
 
 Other commands:
 
+A frame that times out is logged once. The painter keeps running and waits a few seconds before it tries again, so a hung request does not spin.
+
 ```bash
 ./run.sh --once       # draw one frame and exit
+./run.sh --diagnose   # print /api/version and one draw, with HTTP status and body
 ./run.sh --self-test  # check the sky and the request shape, no bar needed
 ./run.sh --preview    # write preview PNGs and open a local gallery
 ```

@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+import socket
 import struct
 import sys
 import threading
@@ -479,7 +480,7 @@ def sidereal_angle(dt: datetime) -> float:
 # Weather + ISS
 # ---------------------------------------------------------------------------
 
-def http_json(url: str, timeout: float = 8.0) -> dict:
+def http_json(url: str, timeout: float = 3.0) -> dict:
     req = urllib.request.Request(
         url,
         headers={"User-Agent": CHROME_UA, "Accept": "application/json"},
@@ -561,7 +562,7 @@ def fetch_iss() -> dict | None:
     last_err: Exception | None = None
     for url in ISS_URLS:
         try:
-            data = http_json(url, timeout=6.0)
+            data = http_json(url, timeout=3.0)
             if "latitude" in data and "longitude" in data:
                 lat = float(data["latitude"])
                 lon = float(data["longitude"])
@@ -1173,14 +1174,166 @@ def apply_place(lat: float, lon: float, tz_name: str, label: str) -> None:
     _SUN_TIMES.clear()
 
 
-def local_draw_url(host: str) -> str:
+# Firmware 1.2.4 / API 27.5.0: GET /api/status/firmware accepts the TCP
+# connection and then sends nothing. Probe /api/version, then /api/status.
+PROBE_PATHS = ("/api/version", "/api/status")
+PROBE_TIMEOUT = 2.0
+DRAW_TIMEOUT = 3.0
+FRAME_PAUSE = 1.0
+RETRY_MIN = 5.0
+RETRY_MAX = 20.0
+# busylib-ts sends this with the semver from GET /version. The published
+# OpenAPI 27.5.0 draw operation does not list a version header. We still
+# echo the semver the bar just reported. X-Busy-Api-Version is the Python
+# library's own target (27.7.0 on current busylib), which is newer than
+# this bar, so it is not sent.
+SEMVER_HEADER = "X-API-Sem-Ver"
+
+
+def device_origin(host: str) -> str:
     base = host.rstrip("/")
     if base.endswith("/api"):
-        return base + "/display/draw"
-    return base + "/api/display/draw"
+        return base[: -len("/api")]
+    return base
 
 
-def draw_request(cfg: Settings, elements: list[dict]) -> tuple[str, dict[str, str], bytes]:
+def local_url(host: str, path: str) -> str:
+    if not path.startswith("/"):
+        path = "/" + path
+    if path.rstrip("/") == "/api/status/firmware":
+        raise ValueError("/api/status/firmware hangs on this firmware and is not used")
+    return device_origin(host) + path
+
+
+def local_draw_url(host: str) -> str:
+    return local_url(host, "/api/display/draw")
+
+
+def pace(failed: bool, backoff: float) -> tuple[float, float]:
+    """Seconds to sleep, and the backoff to use after the next failure.
+
+    A failed frame waits at least RETRY_MIN seconds. The wait grows until
+    RETRY_MAX so a hung bar is not polled in a tight loop.
+    """
+    if not failed:
+        return FRAME_PAUSE, RETRY_MIN
+    return backoff, min(backoff * 2.0, RETRY_MAX)
+
+
+class FailureNotice:
+    """Log a repeated failure once until a different failure or a success."""
+
+    def __init__(self) -> None:
+        self._key: str | None = None
+        self.saw_failure = False
+
+    def once(self, key: str) -> bool:
+        self.saw_failure = True
+        if self._key == key:
+            return False
+        self._key = key
+        return True
+
+    def recovered(self) -> bool:
+        if not self.saw_failure:
+            return False
+        self.saw_failure = False
+        self._key = None
+        return True
+
+
+@dataclass
+class HttpResult:
+    url: str
+    status: int | None
+    body: str
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and self.status is not None and 200 <= self.status < 300
+
+
+def _timeout_text(exc: BaseException, timeout: float) -> str | None:
+    reason = getattr(exc, "reason", None)
+    candidate = reason if reason is not None else exc
+    if isinstance(candidate, TimeoutError) or "timed out" in str(candidate).lower():
+        return f"timeout after {timeout:.1f}s"
+    return None
+
+
+def http_exchange(
+    method: str,
+    url: str,
+    headers: dict[str, str] | None = None,
+    body: bytes | None = None,
+    timeout: float = PROBE_TIMEOUT,
+) -> HttpResult:
+    """One HTTP call with a hard timeout. Timeouts return a result, they do not raise."""
+    req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(8192)
+            return HttpResult(url, getattr(resp, "status", 200), raw.decode("utf-8", "replace"), None)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(8192)
+        return HttpResult(url, exc.code, raw.decode("utf-8", "replace"), None)
+    except (TimeoutError, urllib.error.URLError, OSError) as exc:
+        timed = _timeout_text(exc, timeout)
+        if timed:
+            return HttpResult(url, None, "", timed)
+        reason = getattr(exc, "reason", exc)
+        return HttpResult(url, None, "", str(reason))
+
+
+def semver_from_payload(body: str) -> str | None:
+    """Read api_semver from GET /api/version or system.api_semver from GET /api/status."""
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    direct = data.get("api_semver")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    system = data.get("system")
+    if isinstance(system, dict):
+        nested = system.get("api_semver")
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip()
+    return None
+
+
+def _local_headers(cfg: Settings, api_semver: str | None = None) -> dict[str, str]:
+    headers = {"Accept": "application/json", "User-Agent": "busy-bar-painter"}
+    if cfg.pin:
+        headers["X-API-Token"] = cfg.pin
+    if api_semver:
+        headers[SEMVER_HEADER] = api_semver
+    return headers
+
+
+def probe_bar(cfg: Settings) -> tuple[str | None, list[HttpResult]]:
+    """GET /api/version. If that yields no semver, GET /api/status."""
+    headers = _local_headers(cfg)
+    version = http_exchange(
+        "GET", local_url(cfg.host, PROBE_PATHS[0]), headers, timeout=PROBE_TIMEOUT
+    )
+    results = [version]
+    semver = semver_from_payload(version.body) if version.ok else None
+    if semver:
+        return semver, results
+    status = http_exchange(
+        "GET", local_url(cfg.host, PROBE_PATHS[1]), headers, timeout=PROBE_TIMEOUT
+    )
+    results.append(status)
+    return (semver_from_payload(status.body) if status.ok else None), results
+
+
+def draw_request(
+    cfg: Settings, elements: list[dict], api_semver: str | None = None
+) -> tuple[str, dict[str, str], bytes]:
     """Build the draw call. Does not send it, and never clears the screen."""
     payload = {
         "application_name": APP_NAME,
@@ -1196,27 +1349,57 @@ def draw_request(cfg: Settings, elements: list[dict]) -> tuple[str, dict[str, st
         headers["Authorization"] = f"Bearer {cfg.token or ''}"
         headers["User-Agent"] = CHROME_UA
         return CLOUD_DRAW_URL, headers, body
-    headers["User-Agent"] = "busy-bar-painter"
-    if cfg.pin:
-        headers["X-API-Token"] = cfg.pin
+    headers.update(_local_headers(cfg, api_semver))
     return local_draw_url(cfg.host), headers, body
 
 
-def draw_elements(cfg: Settings, elements: list[dict]) -> None:
+def post_draw(cfg: Settings, elements: list[dict], api_semver: str | None) -> HttpResult:
     """POST one frame. Same element ids replace the previous frame in place."""
     if cfg.transport == "cloud" and not cfg.token:
-        raise RuntimeError("BUSY_BAR_TOKEN is unset")
-    url, headers, body = draw_request(cfg, elements)
-    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=12.0) as resp:
-            resp.read()
-    except urllib.error.HTTPError as exc:
-        detail = exc.read(500).decode("utf-8", "replace")
-        hint = ""
-        if exc.code == 403 and cfg.transport == "usb" and not cfg.pin:
-            hint = " Set BUSY_PIN to the bar HTTP API PIN."
-        raise RuntimeError(f"draw HTTP {exc.code}.{hint} {detail}".strip()) from exc
+        return HttpResult(CLOUD_DRAW_URL, None, "", "BUSY_BAR_TOKEN is unset")
+    url, headers, body = draw_request(cfg, elements, api_semver=api_semver)
+    return http_exchange("POST", url, headers, body, timeout=DRAW_TIMEOUT)
+
+
+def _print_http(label: str, result: HttpResult) -> None:
+    print(f"{label} {result.url}")
+    if result.status is None:
+        print(result.error or "no response")
+        return
+    print(f"HTTP {result.status}")
+    text = result.body.strip()
+    print(text if text else "(empty body)")
+
+
+def diagnose(cfg: Settings) -> int:
+    """Print the version probe and one draw, including HTTP status and body."""
+    print(f"transport {cfg.transport}")
+    semver: str | None = None
+    if cfg.transport == "usb":
+        semver, probes = probe_bar(cfg)
+        for index, probe in enumerate(probes):
+            _print_http("version" if index == 0 else "status", probe)
+        print(f"api_semver {semver or 'unknown'}")
+        if semver:
+            print(f"draw header {SEMVER_HEADER}: {semver}")
+        else:
+            print("draw header none")
+    else:
+        print("cloud skips the USB version probe")
+    # Weather and ISS stay out of this check so a slow forecast cannot hide the bar result.
+    painter = Painter()
+    _canvas, elements, _meta = painter.frame(datetime.now(TZ))
+    result = post_draw(cfg, elements, semver)
+    if result.status == 405 and cfg.transport == "usb":
+        print("draw returned 405, probing the semver again")
+        semver, probes = probe_bar(cfg)
+        for index, probe in enumerate(probes):
+            _print_http("version" if index == 0 else "status", probe)
+        result = post_draw(cfg, elements, semver)
+    _print_http("draw", result)
+    if result.status == 403 and cfg.transport == "usb" and not cfg.pin:
+        print("HTTP 403: set BUSY_PIN to the bar HTTP API PIN")
+    return 0 if result.ok else 1
 
 
 # ---------------------------------------------------------------------------
@@ -1461,6 +1644,7 @@ class Painter:
         self.iss: dict | None = None
         self.weather_ts = 0.0
         self.iss_ts = 0.0
+        self.iss_every = 5.0
 
     def refresh(self, now: float) -> None:
         if now - self.weather_ts > 600 or not self.weather_ts:
@@ -1470,15 +1654,20 @@ class Painter:
             except Exception as exc:  # noqa: BLE001
                 log.warning("weather fetch failed: %s", exc)
                 self.weather_ts = now - 540  # retry sooner
-        if now - self.iss_ts > 5 or not self.iss_ts:
+        if now - self.iss_ts >= self.iss_every or not self.iss_ts:
             try:
                 got = fetch_iss()
                 if got:
                     self.iss = got
+                    self.iss_every = 5.0
+                else:
+                    # A timed-out satellite API must not stall every frame.
+                    self.iss_every = 60.0
                 self.iss_ts = now
             except Exception as exc:  # noqa: BLE001
                 log.warning("ISS fetch failed: %s", exc)
                 self.iss_ts = now
+                self.iss_every = 60.0
 
     def frame(self, dt: datetime) -> tuple[Canvas, list[dict], dict]:
         period = period_for(dt)
@@ -1503,13 +1692,28 @@ class Painter:
         return canvas, elements, meta
 
 
+def _remember(ok: bool | None, error: str | None, frames_inc: bool, semver: str | None) -> None:
+    with _STATE_LOCK:
+        STATE["ok"] = True
+        STATE["last_draw_ok"] = ok
+        STATE["last_error"] = error
+        STATE["api_semver"] = semver
+        if frames_inc:
+            STATE["frames"] = int(STATE["frames"]) + 1
+
+
 def run_loop(cfg: Settings, painter: Painter, once: bool = False) -> int:
+    notice = FailureNotice()
+    backoff = RETRY_MIN
+    semver: str | None = None
+    semver_known = cfg.transport != "usb"
     while True:
+        failed = False
         try:
             now = time.time()
             painter.refresh(now)
             dt = datetime.now(TZ)
-            canvas, elements, meta = painter.frame(dt)
+            _canvas, elements, meta = painter.frame(dt)
             with _STATE_LOCK:
                 STATE.update(
                     {
@@ -1522,46 +1726,67 @@ def run_loop(cfg: Settings, painter: Painter, once: bool = False) -> int:
                         "clock": meta["clock"],
                         "iss_km": meta["iss_km"],
                         "iss_state": meta["iss_state"] or "far",
-                        "last_error": None,
                     }
                 )
             if cfg.transport == "cloud" and not cfg.token:
-                log.warning("BUSY_BAR_TOKEN is unset, so cloud mode is not drawing")
-                with _STATE_LOCK:
-                    STATE["last_draw_ok"] = None
-                    STATE["frames"] = int(STATE["frames"]) + 1
+                failed = True
+                if notice.once("BUSY_BAR_TOKEN is unset"):
+                    log.warning("BUSY_BAR_TOKEN is unset, so cloud mode is not drawing")
+                _remember(None, "BUSY_BAR_TOKEN is unset", True, None)
             else:
-                draw_elements(cfg, elements)
-                with _STATE_LOCK:
-                    STATE["last_draw_ok"] = True
-                    STATE["frames"] = int(STATE["frames"]) + 1
-            log.info(
-                "frame %s %s %s %s iss=%s km=%s park=%s",
-                meta["clock"],
-                meta["temp"],
-                meta["period"],
-                meta["weather"],
-                meta["iss_state"],
-                meta["iss_km"],
-                meta["park"],
-            )
-        except urllib.error.URLError as exc:
-            reason = getattr(exc, "reason", exc)
-            log.error("cannot reach the bar: %s", reason)
-            with _STATE_LOCK:
-                STATE["ok"] = True
-                STATE["last_error"] = str(reason)
-                STATE["last_draw_ok"] = False
+                if cfg.transport == "usb" and not semver_known:
+                    found, probes = probe_bar(cfg)
+                    semver = found
+                    semver_known = found is not None
+                    for probe in probes:
+                        if probe.ok:
+                            continue
+                        detail = probe.error or f"HTTP {probe.status} {probe.body[:180]}"
+                        if notice.once(f"probe {probe.url} {detail}"):
+                            log.error("probe %s: %s", probe.url, detail)
+                    if semver:
+                        log.info("bar api_semver %s", semver)
+                result = post_draw(cfg, elements, semver)
+                if result.status == 405 and cfg.transport == "usb":
+                    semver, _probes = probe_bar(cfg)
+                    semver_known = semver is not None
+                    if semver:
+                        log.info("bar api_semver %s", semver)
+                    result = post_draw(cfg, elements, semver)
+                if result.ok:
+                    if notice.recovered():
+                        log.info("bar is answering again")
+                    backoff = RETRY_MIN
+                    _remember(True, None, True, semver)
+                    log.info(
+                        "frame %s %s %s %s iss=%s km=%s park=%s",
+                        meta["clock"],
+                        meta["temp"],
+                        meta["period"],
+                        meta["weather"],
+                        meta["iss_state"],
+                        meta["iss_km"],
+                        meta["park"],
+                    )
+                else:
+                    failed = True
+                    detail = result.error or f"HTTP {result.status} {result.body[:180]}".strip()
+                    if result.status == 403 and cfg.transport == "usb" and not cfg.pin:
+                        detail = f"{detail} Set BUSY_PIN to the bar HTTP API PIN."
+                    if notice.once(detail):
+                        log.error("draw %s", detail)
+                    _remember(False, detail, False, semver)
         except Exception as exc:  # noqa: BLE001 - one bad frame must not kill the painter
-            log.error("draw-loop exception: %s\n%s", exc, traceback.format_exc())
-            with _STATE_LOCK:
-                STATE["ok"] = True  # process still alive
-                STATE["last_error"] = str(exc)
-                STATE["last_draw_ok"] = False
+            failed = True
+            detail = f"{type(exc).__name__}: {exc}"
+            if notice.once(detail):
+                log.error("frame failed: %s\n%s", exc, traceback.format_exc())
+            _remember(False, detail, False, semver)
         if once:
             with _STATE_LOCK:
                 return 0 if STATE.get("last_draw_ok") else 1
-        time.sleep(1.0)
+        wait, backoff = pace(failed, backoff)
+        time.sleep(wait)
 
 
 # ---------------------------------------------------------------------------
@@ -1939,6 +2164,56 @@ def self_test() -> int:
     )
     _, headers, _ = draw_request(prefer, [])
     check(headers.get("Authorization") == "Bearer new", "BUSY_BAR_TOKEN wins")
+    url, headers, _ = draw_request(usb, [], api_semver="27.5.0")
+    check(headers.get(SEMVER_HEADER) == "27.5.0", f"usb semver header {headers}")
+    check("X-Busy-Api-Version" not in headers, "usb does not send the library version header")
+    check("status/firmware" not in url, "draw url avoids the hanging firmware path")
+    _, cloud_headers, _ = draw_request(cloud, [], api_semver="27.5.0")
+    check(SEMVER_HEADER not in cloud_headers, "cloud draw stays bearer only")
+    check(PROBE_PATHS == ("/api/version", "/api/status"), f"probe paths {PROBE_PATHS}")
+    check(all("firmware" not in path for path in PROBE_PATHS), "probe list has no firmware path")
+    try:
+        local_url(DEFAULT_HOST, "/api/status/firmware")
+        failures.append("firmware path was allowed")
+    except ValueError:
+        pass
+    check(semver_from_payload('{"api_semver":"27.5.0"}') == "27.5.0", "version semver")
+    check(
+        semver_from_payload('{"system":{"api_semver":"27.5.0"},"firmware":{"version":"1.2.4"}}')
+        == "27.5.0",
+        "status semver",
+    )
+    check(semver_from_payload("not-json") is None, "bad probe body")
+    notice = FailureNotice()
+    check(notice.once("timeout after 2.0s") is True, "first timeout logs")
+    check(notice.once("timeout after 2.0s") is False, "repeat timeout stays quiet")
+    check(notice.once("HTTP 403") is True, "a new error logs")
+    check(notice.recovered() is True, "recovery is announced once")
+    check(notice.recovered() is False, "recovery does not repeat")
+    check(pace(False, 20.0) == (FRAME_PAUSE, RETRY_MIN), "success returns to the frame pause")
+    check(pace(True, RETRY_MIN) == (RETRY_MIN, RETRY_MIN * 2), "first failure waits")
+    check(pace(True, RETRY_MAX)[0] >= RETRY_MIN, "backoff never tightens to the frame pause")
+    hang = socket.socket()
+    hang.bind(("127.0.0.1", 0))
+    hang.listen(1)
+    hang_port = hang.getsockname()[1]
+
+    def _hold() -> None:
+        try:
+            conn, _addr = hang.accept()
+            time.sleep(3)
+            conn.close()
+        except OSError:
+            return
+
+    threading.Thread(target=_hold, daemon=True).start()
+    started = time.monotonic()
+    hung = http_exchange("GET", f"http://127.0.0.1:{hang_port}/api/version", {}, timeout=0.4)
+    elapsed = time.monotonic() - started
+    hang.close()
+    check(hung.status is None, f"hung probe status {hung.status}")
+    check(hung.error is not None and "timeout" in hung.error, f"hung probe error {hung.error}")
+    check(elapsed < 2.0, f"hung probe stalled for {elapsed:.2f}s")
     dotted = parse_dotenv('# comment\nexport BUSY_PIN="12 34"\nBUSY_LAT=1\n\n')
     check(dotted.get("BUSY_PIN") == "12 34" and dotted.get("BUSY_LAT") == "1", "dotenv parse")
     check("comment" not in dotted, "dotenv skips comments")
@@ -1967,6 +2242,11 @@ def main() -> int:
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--preview", action="store_true", help="write preview PNGs and serve the gallery")
     parser.add_argument("--once", action="store_true", help="draw one frame and exit")
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="print the version probe and one draw, then exit",
+    )
     parser.add_argument("--no-serve", action="store_true")
     args = parser.parse_args()
 
@@ -1994,6 +2274,9 @@ def main() -> int:
         log.info("usb draw %s pin=%s", local_draw_url(cfg.host), "set" if cfg.pin else "unset")
     else:
         log.info("cloud draw %s token=%s", CLOUD_DRAW_URL, "set" if cfg.token else "unset")
+
+    if args.diagnose:
+        return diagnose(cfg)
 
     if args.preview:
         write_preview_set()
