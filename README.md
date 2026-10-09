@@ -57,6 +57,16 @@ When that happens the log says this once:
 
 `DNS failed. In System Settings > Network > Set Service Order, move the Busy Bar USB interface below Wi-Fi.`
 
+## Corporate proxy
+
+Some work Macs have no direct DNS or internet. System Settings shows a proxy auto-config (PAC) instead. Python then fails with `Errno 8` on `socket.gethostbyname`, and a plain `curl` to the weather service returns `000`.
+
+Weather and the ISS honor `BUSY_PROXY`, then `HTTPS_PROXY`, then `HTTP_PROXY`. On a Mac, if none of those is set, the painter runs `scutil --proxy`, fetches that PAC file directly, and uses the first `PROXY host:port` line. The log names the proxy host once and does not print a username or password. Requests to `10.0.4.20`, `localhost`, and anything in `NO_PROXY` always go direct, including every draw to the bar.
+
+If the proxy answers HTTP 407, set `BUSY_PROXY` to `http://user:password@host:port`. If certificate checks fail because the proxy intercepts HTTPS, set `BUSY_CA_BUNDLE` to your corporate root CA file. `BUSY_INSECURE_TLS=1` skips verification for weather and the ISS only. That setting is not recommended.
+
+`./run.sh --diagnose` prints the version probe, one draw, and a weather fetch.
+
 ## Pause the hosted Fly painter
 
 If a painter hosted on Fly is also drawing to this bar, pause that app before you start this one. Two painters writing the screen at the same time will take turns overwriting each other.
@@ -77,6 +87,12 @@ Set `BUSY_TRANSPORT=cloud` and `BUSY_BAR_TOKEN` to a bar-scope token from your B
 | `BUSY_LON` | `-121.9552` | Longitude |
 | `BUSY_TZ` | `America/Los_Angeles` | IANA time zone for the clock and the sky |
 | `BUSY_LABEL` | `Santa Clara, CA` | Place name written to the log |
+| `BUSY_PROXY` | empty | Proxy for weather and the ISS. Wins over `HTTPS_PROXY` and `HTTP_PROXY` |
+| `HTTPS_PROXY` | empty | Used when `BUSY_PROXY` is empty |
+| `HTTP_PROXY` | empty | Used when `BUSY_PROXY` and `HTTPS_PROXY` are empty |
+| `NO_PROXY` | `10.0.4.20,localhost,127.0.0.1` | Hosts that always connect directly. The bar is always direct |
+| `BUSY_CA_BUNDLE` | empty | Corporate root CA file, when the proxy intercepts HTTPS |
+| `BUSY_INSECURE_TLS` | empty | `1` skips TLS checks for weather and the ISS only. Not recommended |
 
 Other commands:
 
@@ -84,7 +100,7 @@ A single draw timeout stays on the normal cadence. The longer wait starts after 
 
 ```bash
 ./run.sh --once       # draw one frame and exit
-./run.sh --diagnose   # print /api/version and one draw, with HTTP status and body
+./run.sh --diagnose   # print /api/version, one draw, and a weather fetch
 ./run.sh --self-test  # check the sky and the request shape, no bar needed
 ./run.sh --preview    # write preview PNGs and open a local gallery
 ```

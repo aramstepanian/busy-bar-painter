@@ -17,8 +17,11 @@ import json
 import logging
 import math
 import os
+import re
 import socket
+import ssl
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -30,7 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterable, Mapping
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # ---------------------------------------------------------------------------
@@ -480,13 +483,249 @@ def sidereal_angle(dt: datetime) -> float:
 # Weather + ISS
 # ---------------------------------------------------------------------------
 
-def http_json(url: str, timeout: float = 3.0) -> dict:
-    req = urllib.request.Request(
+# Weather and the ISS need the corporate proxy. The bar at 10.0.4.20 never does.
+INTERNET_TIMEOUT = 8.0
+_PAC_PROXY_RE = re.compile(r"\bPROXY\s+([A-Za-z0-9._-]+:\d+)\b", re.IGNORECASE)
+_PROXY_SECRET_RE = re.compile(r"(https?://)[^/\s:@]+:[^/\s@]+@")
+PROXY_AUTH_HINT = (
+    "The proxy asked for a username and password (HTTP 407). "
+    "Set BUSY_PROXY to http://user:password@host:port. "
+    "The log shows the proxy host only."
+)
+TLS_HINT = (
+    "Certificate verification failed. A corporate proxy may be intercepting HTTPS. "
+    "Set BUSY_CA_BUNDLE to the path of your corporate root CA. "
+    "BUSY_INSECURE_TLS=1 skips verification for weather and ISS only and is not recommended."
+)
+INSECURE_TLS_HINT = (
+    "BUSY_INSECURE_TLS=1 skips certificate checks for weather and ISS only. Not recommended."
+)
+_PROXY_STATE: dict[str, object] = {"resolved": False, "url": None, "logged": False}
+_PROXY_AUTH_HINTED = False
+_TLS_HINTED = False
+_INSECURE_HINTED = False
+
+
+def scrub_proxy_secrets(text: str) -> str:
+    return _PROXY_SECRET_RE.sub(r"\1", text)
+
+
+def normalize_proxy(url: str) -> str:
+    url = url.strip()
+    if url and "://" not in url:
+        url = "http://" + url
+    return url
+
+
+def redact_proxy(url: str) -> str:
+    """Host and port only. Usernames and passwords stay out of the log."""
+    parts = urlsplit(normalize_proxy(url))
+    if not parts.hostname:
+        return "proxy"
+    port = f":{parts.port}" if parts.port else ""
+    scheme = parts.scheme or "http"
+    return f"{scheme}://{parts.hostname}{port}"
+
+
+def proxy_from_env(env: Mapping[str, str] | None = None) -> str | None:
+    """BUSY_PROXY wins, then HTTPS_PROXY, then HTTP_PROXY."""
+    source = env if env is not None else os.environ
+    for name in ("BUSY_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        value = (source.get(name) or "").strip()
+        if value:
+            return normalize_proxy(value)
+    return None
+
+
+def proxy_url_from_scutil_text(text: str) -> str | None:
+    """Return the PAC URL when auto-config is enabled. The URL is whatever scutil printed."""
+    if not re.search(r"ProxyAutoConfigEnable\s*:\s*1\b", text):
+        return None
+    match = re.search(r"ProxyAutoConfigURLString\s*:\s*(\S+)", text)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def first_proxy_from_pac(text: str) -> str | None:
+    """First `PROXY host:port` in a PAC file. No JavaScript engine."""
+    match = _PAC_PROXY_RE.search(text)
+    if not match:
+        return None
+    return "http://" + match.group(1)
+
+
+def _no_proxy_hosts() -> set[str]:
+    hosts = {"10.0.4.20", "localhost", "127.0.0.1"}
+    raw = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    for item in raw.split(","):
+        item = item.strip().lower().lstrip(".")
+        if item and item != "*":
+            hosts.add(item)
+    return hosts
+
+
+def should_bypass_proxy(url: str) -> bool:
+    """Bar, localhost, and NO_PROXY hosts never use the corporate proxy."""
+    host = (urlsplit(url).hostname or "").lower()
+    if not host:
+        return False
+    raw = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    if any(part.strip() == "*" for part in raw.split(",")):
+        return True
+    if host in _no_proxy_hosts():
+        return True
+    return any(host.endswith("." + item) for item in _no_proxy_hosts())
+
+
+def pac_url_from_scutil() -> str | None:
+    if sys.platform != "darwin":
+        return None
+    try:
+        proc = subprocess.run(
+            ["scutil", "--proxy"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proxy_url_from_scutil_text(proc.stdout or "")
+
+
+def proxy_from_pac(pac_url: str) -> str | None:
+    """Fetch the PAC directly. The proxy it names is not known yet."""
+    req = urllib.request.Request(pac_url, headers={"User-Agent": "busy-bar-painter"})
+    try:
+        with direct_opener().open(req, timeout=5) as resp:
+            body = resp.read(200_000).decode("utf-8", "replace")
+    except (TimeoutError, urllib.error.URLError, OSError) as exc:
+        log.warning("could not read the proxy auto-config: %s", scrub_proxy_secrets(str(exc)))
+        log.warning("Set BUSY_PROXY to http://host:port if weather cannot reach the network.")
+        return None
+    return first_proxy_from_pac(body)
+
+
+def reset_proxy_state() -> None:
+    _PROXY_STATE["resolved"] = False
+    _PROXY_STATE["url"] = None
+    _PROXY_STATE["logged"] = False
+
+
+def internet_proxy() -> str | None:
+    """Resolve the proxy once. Logs the host and port, never the password."""
+    if not _PROXY_STATE["resolved"]:
+        chosen = proxy_from_env()
+        if not chosen:
+            pac_url = pac_url_from_scutil()
+            if pac_url:
+                chosen = proxy_from_pac(pac_url)
+        _PROXY_STATE["url"] = chosen
+        _PROXY_STATE["resolved"] = True
+    proxy = _PROXY_STATE["url"]
+    if proxy and not _PROXY_STATE["logged"]:
+        log.info("internet proxy %s", redact_proxy(str(proxy)))
+        _PROXY_STATE["logged"] = True
+    return str(proxy) if proxy else None
+
+
+def _insecure_tls() -> bool:
+    return os.environ.get("BUSY_INSECURE_TLS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _ca_bundle() -> str | None:
+    path = os.environ.get("BUSY_CA_BUNDLE", "").strip()
+    return path or None
+
+
+def note_proxy_auth() -> None:
+    global _PROXY_AUTH_HINTED
+    if _PROXY_AUTH_HINTED:
+        return
+    _PROXY_AUTH_HINTED = True
+    log.error("%s", PROXY_AUTH_HINT)
+
+
+def note_tls() -> None:
+    global _TLS_HINTED
+    if _TLS_HINTED:
+        return
+    _TLS_HINTED = True
+    log.error("%s", TLS_HINT)
+
+
+def note_insecure_tls() -> None:
+    global _INSECURE_HINTED
+    if _INSECURE_HINTED:
+        return
+    _INSECURE_HINTED = True
+    log.warning("%s", INSECURE_TLS_HINT)
+
+
+def is_tls_error(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLError):
+            return True
+        text = str(current).lower()
+        if "certificate verify failed" in text or "certificate_verify_failed" in text:
+            return True
+        reason = getattr(current, "reason", None)
+        if isinstance(reason, BaseException):
+            current = reason
+            continue
+        cause = current.__cause__
+        current = cause if isinstance(cause, BaseException) else None
+    return False
+
+
+def internet_ssl_context(*, insecure: bool) -> ssl.SSLContext:
+    if insecure:
+        note_insecure_tls()
+        return ssl._create_unverified_context()
+    cafile = _ca_bundle()
+    if cafile:
+        return ssl.create_default_context(cafile=cafile)
+    return ssl.create_default_context()
+
+
+def direct_opener() -> urllib.request.OpenerDirector:
+    """Ignore HTTP_PROXY. Used for the bar and for reading the PAC file."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def internet_opener(*, insecure: bool) -> urllib.request.OpenerDirector:
+    proxy = internet_proxy()
+    proxies = {"http": proxy, "https": proxy} if proxy else {}
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler(proxies),
+        urllib.request.HTTPSHandler(context=internet_ssl_context(insecure=insecure)),
+    )
+
+
+def opener_proxies(opener: urllib.request.OpenerDirector) -> dict[str, str]:
+    for handler in opener.handlers:
+        proxies = getattr(handler, "proxies", None)
+        if isinstance(proxies, dict):
+            return dict(proxies)
+    return {}
+
+
+def http_json(url: str, timeout: float = INTERNET_TIMEOUT) -> dict:
+    result = internet_exchange(
+        "GET",
         url,
         headers={"User-Agent": CHROME_UA, "Accept": "application/json"},
+        timeout=timeout,
+        insecure=_insecure_tls(),
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    if not result.ok:
+        detail = result.error or f"HTTP {result.status} {result.body[:200]}".strip()
+        raise urllib.error.URLError(detail)
+    return json.loads(result.body)
 
 
 def classify_weather(code: int, visibility_m: float | None = None) -> str:
@@ -670,7 +909,7 @@ def fetch_iss() -> dict | None:
     last_err: Exception | None = None
     for url in ISS_URLS:
         try:
-            data = http_json(url, timeout=3.0)
+            data = http_json(url, timeout=INTERNET_TIMEOUT)
             if "latitude" in data and "longitude" in data:
                 lat = float(data["latitude"])
                 lon = float(data["longitude"])
@@ -1400,28 +1639,67 @@ def _timeout_text(exc: BaseException, timeout: float) -> str | None:
     return None
 
 
+def _read_exchange(
+    opener: urllib.request.OpenerDirector,
+    method: str,
+    url: str,
+    headers: dict[str, str] | None,
+    body: bytes | None,
+    timeout: float,
+) -> HttpResult:
+    """One HTTP call with a hard timeout. Timeouts return a result, they do not raise."""
+    req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            raw = resp.read(8192)
+            return HttpResult(url, getattr(resp, "status", 200), raw.decode("utf-8", "replace"), None)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(8192)
+        if exc.code == 407:
+            note_proxy_auth()
+        return HttpResult(url, exc.code, raw.decode("utf-8", "replace"), None)
+    except (TimeoutError, urllib.error.URLError, OSError) as exc:
+        if is_tls_error(exc):
+            note_tls()
+        timed = _timeout_text(exc, timeout)
+        if timed:
+            return HttpResult(url, None, "", timed)
+        reason = getattr(exc, "reason", exc)
+        return HttpResult(url, None, "", scrub_proxy_secrets(str(reason)))
+
+
 def http_exchange(
     method: str,
     url: str,
     headers: dict[str, str] | None = None,
     body: bytes | None = None,
     timeout: float = PROBE_TIMEOUT,
+    *,
+    direct: bool = True,
 ) -> HttpResult:
-    """One HTTP call with a hard timeout. Timeouts return a result, they do not raise."""
-    req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read(8192)
-            return HttpResult(url, getattr(resp, "status", 200), raw.decode("utf-8", "replace"), None)
-    except urllib.error.HTTPError as exc:
-        raw = exc.read(8192)
-        return HttpResult(url, exc.code, raw.decode("utf-8", "replace"), None)
-    except (TimeoutError, urllib.error.URLError, OSError) as exc:
-        timed = _timeout_text(exc, timeout)
-        if timed:
-            return HttpResult(url, None, "", timed)
-        reason = getattr(exc, "reason", exc)
-        return HttpResult(url, None, "", str(reason))
+    """Bar and localhost calls stay direct even when HTTPS_PROXY is set."""
+    if direct or should_bypass_proxy(url):
+        opener = direct_opener()
+    else:
+        opener = internet_opener(insecure=False)
+    return _read_exchange(opener, method, url, headers, body, timeout)
+
+
+def internet_exchange(
+    method: str,
+    url: str,
+    headers: dict[str, str] | None = None,
+    body: bytes | None = None,
+    timeout: float = INTERNET_TIMEOUT,
+    *,
+    insecure: bool = False,
+) -> HttpResult:
+    """Weather and ISS. BUSY_INSECURE_TLS applies only on this path."""
+    if should_bypass_proxy(url):
+        opener = direct_opener()
+    else:
+        opener = internet_opener(insecure=insecure)
+    return _read_exchange(opener, method, url, headers, body, timeout)
 
 
 def semver_from_payload(body: str) -> str | None:
@@ -1499,7 +1777,15 @@ def post_draw(cfg: Settings, elements: list[dict], api_semver: str | None) -> Ht
     if not begin_draw():
         return HttpResult(url, None, "", "draw already in progress")
     try:
-        return http_exchange("POST", url, headers, body, timeout=DRAW_TIMEOUT)
+        # 10.0.4.20 is forced direct inside http_exchange. Cloud uses the proxy.
+        return http_exchange(
+            "POST",
+            url,
+            headers,
+            body,
+            timeout=DRAW_TIMEOUT,
+            direct=cfg.transport != "cloud",
+        )
     finally:
         end_draw()
 
@@ -1542,7 +1828,27 @@ def diagnose(cfg: Settings) -> int:
     _print_http("draw", result)
     if result.status == 403 and cfg.transport == "usb" and not cfg.pin:
         print("HTTP 403: set BUSY_PIN to the bar HTTP API PIN")
+    _diagnose_weather()
     return 0 if result.ok else 1
+
+
+def _diagnose_weather() -> None:
+    """Show how weather left the machine. The bar result above is independent."""
+    proxy = internet_proxy()
+    print(f"internet proxy {redact_proxy(proxy) if proxy else 'direct'}")
+    url = weather_url()
+    result = internet_exchange(
+        "GET",
+        url,
+        headers={"User-Agent": CHROME_UA, "Accept": "application/json"},
+        timeout=INTERNET_TIMEOUT,
+        insecure=_insecure_tls(),
+    )
+    _print_http("weather", result)
+    if result.status == 407:
+        print(PROXY_AUTH_HINT)
+    elif result.error and "certificate" in result.error.lower():
+        print(TLS_HINT)
 
 
 # ---------------------------------------------------------------------------
@@ -1812,7 +2118,7 @@ class Painter:
                 if is_dns_error(exc):
                     note_dns(exc)
                 else:
-                    log.warning("weather fetch failed: %s", exc)
+                    log.warning("weather fetch failed: %s", scrub_proxy_secrets(str(exc)))
             else:
                 self.weather = got
                 self.weather_ts = now
@@ -1838,7 +2144,7 @@ class Painter:
                     note_dns(exc)
                     self.iss_every = self.weather_every
                 else:
-                    log.warning("ISS fetch failed: %s", exc)
+                    log.warning("ISS fetch failed: %s", scrub_proxy_secrets(str(exc)))
                     self.iss_every = 60.0
 
     def frame(self, dt: datetime) -> tuple[Canvas, list[dict], dict]:
@@ -2397,6 +2703,58 @@ def self_test() -> int:
     check(notice.once("HTTP 403") is True, "a new error logs")
     check(notice.recovered() is True, "recovery is announced once")
     check(notice.recovered() is False, "recovery does not repeat")
+    saved_proxy_env = {
+        key: os.environ.get(key)
+        for key in ("BUSY_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY")
+    }
+    try:
+        for key in saved_proxy_env:
+            os.environ.pop(key, None)
+        os.environ["HTTPS_PROXY"] = "http://env-proxy.example:8000"
+        os.environ["BUSY_PROXY"] = "http://user:s3cret@proxy.example:8080"
+        reset_proxy_state()
+        chosen = internet_proxy()
+        check(chosen == "http://user:s3cret@proxy.example:8080", "BUSY_PROXY wins over HTTPS_PROXY")
+        redacted = redact_proxy(chosen or "")
+        check(redacted == "http://proxy.example:8080", f"proxy log line {redacted}")
+        check("s3cret" not in redacted, "proxy log omits the password")
+        inet = opener_proxies(internet_opener(insecure=False))
+        check(inet.get("https") == chosen, "weather opener uses the proxy")
+        check(opener_proxies(direct_opener()) == {}, "bar opener ignores the proxy env")
+        check(should_bypass_proxy("http://10.0.4.20/api/version"), "10.0.4.20 stays direct")
+        check(should_bypass_proxy("http://127.0.0.1:9/api/version"), "localhost stays direct")
+        check(
+            not should_bypass_proxy("https://api.open-meteo.com/v1/forecast?latitude=1"),
+            "weather is not in NO_PROXY",
+        )
+        pac = 'function FindProxyForURL(url, host) {\n  return "PROXY proxy.example:3128; DIRECT";\n}\n'
+        check(first_proxy_from_pac(pac) == "http://proxy.example:3128", "first PAC proxy")
+        scutil = (
+            "ProxyAutoConfigEnable : 1\n"
+            "ProxyAutoConfigURLString : http://pac.example.test/proxy.pac\n"
+        )
+        check(
+            proxy_url_from_scutil_text(scutil) == "http://pac.example.test/proxy.pac",
+            "scutil pac url",
+        )
+        check(
+            proxy_url_from_scutil_text(
+                "ProxyAutoConfigEnable : 0\nProxyAutoConfigURLString : http://pac.example.test/proxy.pac\n"
+            )
+            is None,
+            "disabled pac is ignored",
+        )
+        check(
+            "s3cret" not in scrub_proxy_secrets("tunnel http://user:s3cret@proxy.example:8080 failed"),
+            "errors omit proxy passwords",
+        )
+    finally:
+        reset_proxy_state()
+        for key, value in saved_proxy_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     check(pace(False, 20.0) == (FRAME_PAUSE, RETRY_MIN), "success returns to the frame pause")
     check(pace(False, 20.0, USB_FRAME_PAUSE) == (USB_FRAME_PAUSE, RETRY_MIN), "usb cadence is 2s")
     check(DRAW_TIMEOUT == 8.0, "draw timeout is 8s")
