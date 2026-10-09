@@ -1,0 +1,2 @@
+# The painter uses the Python 3 standard library only.
+# ./run.sh installs this file so adding a package later stays one step.
